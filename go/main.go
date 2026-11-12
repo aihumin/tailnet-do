@@ -7,6 +7,7 @@
 //	                        dnsQuery(Uint8Array) -> Promise<Uint8Array>
 //	                        log(line)
 //	newNode(config) -> node
+//	useACMEDirectory(url) -> error message or ""
 //
 // One Go runtime per isolate can host many nodes. A JS socket ("sock") is any
 // object with read() -> Promise<Uint8Array|null>, write(u8) -> Promise,
@@ -59,6 +60,14 @@ func main() {
 	}))
 	api.Set("newNode", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		return newNode(a[0])
+	}))
+	// useACMEDirectory(url) -> "" or an error message. Called before
+	// serveHTTPS; url "" is the default directory.
+	api.Set("useACMEDirectory", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		if err := useACMEDirectory(a[0].String()); err != nil {
+			return err.Error()
+		}
+		return ""
 	}))
 	js.Global().Set("__tailnet", api)
 	<-make(chan bool)
@@ -387,8 +396,9 @@ func newNode(cfg js.Value) js.Value {
 	// serveHTTPS(port, handler) -> Promise<{domain, expiry}>: serveHTTP
 	// behind TLS, with the certificate Tailscale issues for the node's
 	// MagicDNS name. The port accepts connections at once and handshakes
-	// wait for the certificate. The promise settles with the first attempt
-	// to get one; after a failure the node keeps retrying.
+	// wait for the certificate. The promise settles with the next attempt
+	// to get one, which waits for the node to be running; after a failure
+	// the node keeps retrying.
 	o.Set("serveHTTPS", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		ready := n.serveHTTPS(uint16(a[0].Int()), a[1])
 		return promise(func() (any, error) {
@@ -408,11 +418,12 @@ func newNode(cfg js.Value) js.Value {
 			m := n.certs
 			n.mu.Unlock()
 			if m == nil {
-				return nil, errors.New("renewCert: serveHTTPS has not been called")
+				return nil, errors.New("there is no certificate to renew: serveHTTPS has not been called")
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), certLoadTimeout)
-			defer cancel()
-			if _, err := m.renew(ctx); err != nil {
+			// No deadline of our own: every load is bounded, and
+			// giving up on an issuance that then succeeds would
+			// only invite another one.
+			if _, err := m.renew(context.Background()); err != nil {
 				return nil, err
 			}
 			info, _ := m.info()
@@ -667,10 +678,10 @@ func (n *node) serveHTTP(port uint16, handler js.Value) {
 	go srv.Serve(ln)
 }
 
-// serveHTTPS is serveHTTP behind TLS. The returned func blocks until the
-// first attempt to get the certificate has an outcome, or the listener is
-// closed.
-func (n *node) serveHTTPS(port uint16, handler js.Value) (ready func() (*certInfo, error)) {
+// serveHTTPS is serveHTTP behind TLS. The returned func blocks until a
+// certificate is in place, the next attempt to get one has failed, or the
+// listener is closed.
+func (n *node) serveHTTPS(port uint16, handler js.Value) func() (*certInfo, error) {
 	n.mu.Lock()
 	if n.certs == nil {
 		n.certs = newCertManager(logf, n.certDomain, func(ctx context.Context, domain string, minValidity time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
@@ -680,6 +691,7 @@ func (n *node) serveHTTPS(port uint16, handler js.Value) (ready func() (*certInf
 	m := n.certs
 	n.mu.Unlock()
 
+	ready := m.watch() // before acquire, which may start the load it reports
 	m.acquire()
 	ctx, cancel := context.WithCancelCause(context.Background())
 	ln := newChanListener()
@@ -694,13 +706,7 @@ func (n *node) serveHTTPS(port uint16, handler js.Value) (ready func() (*certInf
 		GetCertificate: m.getCertificate,
 		NextProtos:     []string{"h2", "http/1.1"},
 	}))
-	return func() (*certInfo, error) {
-		info, err := m.waitFirst(ctx)
-		if err != nil && ctx.Err() != nil {
-			err = context.Cause(ctx)
-		}
-		return info, err
-	}
+	return func() (*certInfo, error) { return ready(ctx) }
 }
 
 // certDomain returns the name the node gets its TLS certificate for: its
