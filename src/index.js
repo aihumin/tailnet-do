@@ -251,10 +251,11 @@ export class Tailnet {
    * Current state: { state, name, addrs, peers, loginURL?, certDomain?,
    * certExpiry?, certError? }.
    *
-   * certDomain is the name serveHTTPS gets a certificate for, and is absent
-   * while HTTPS certificates are disabled for the tailnet. certExpiry (ISO
-   * 8601) is set once serveHTTPS has a certificate. certError says why the
-   * last attempt to get or refresh it failed.
+   * certDomain is the name serveHTTPS gets a certificate for. It is absent
+   * until the node is running, and while HTTPS certificates are disabled for
+   * the tailnet. certExpiry (ISO 8601) is set once serveHTTPS has a
+   * certificate. certError says why the last attempt to get or refresh it
+   * failed.
    */
   status() {
     return { ...this.#status, ...this.#node.status() };
