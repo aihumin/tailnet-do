@@ -72,11 +72,13 @@ The node then answers on `https://<hostname>.<tailnet>.ts.net/` with a certifica
 - `src/` is the JS library. `src/tailnet.wasm` is a build output.
 - `examples/exit-node/` is an exit node that also serves a page on the tailnet.
 - `examples/https-node/` serves `hello <loginName>` over HTTPS on port 443, and over HTTP on port 80.
+- `test/local-tailnet/` is an end-to-end test of HTTPS serving that needs no tailnet and no Let's Encrypt. It runs the https-node example against a control server, DERP relay and ACME CA from Tailscale's test packages, all on loopback.
 
 ```sh
 git submodule update --init --depth 1
 npm run build                      # apply patches, then build src/tailnet.wasm
 npm test                           # Go engine unit tests, run as wasm under Node
+npm run test:e2e                   # test/local-tailnet/run.sh
 cd examples/exit-node && npx wrangler dev
 ```
 
