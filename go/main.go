@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"tailscale.com/control/controlclient"
+	_ "tailscale.com/feature/acme" // TLS certificates for serveHTTPS
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
