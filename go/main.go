@@ -552,6 +552,7 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 	n.lb, n.ns, n.dialer = lb, ns, dialer
 	n.httpc = &http.Client{Transport: &http.Transport{DialContext: dialer.UserDial}}
 
+	var keyLogin sync.Once
 	lb.SetNotifyCallback(func(nt ipn.Notify) {
 		if nt.State != nil {
 			status(map[string]any{"state": nt.State.String()})
@@ -561,8 +562,19 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 			if certs != nil {
 				certs.stateChanged()
 			}
-			if *nt.State == ipn.NeedsLogin && authKey == "" {
-				go lb.StartLoginInteractive(context.Background())
+			if *nt.State == ipn.NeedsLogin {
+				// A node without a node key has to be told to log in,
+				// auth key or not: Start only logs in by itself when
+				// the state store already has a node key. With an auth
+				// key that is one attempt, so a logout or a rejected
+				// key leaves the node logged out. Without one, every
+				// NeedsLogin gets a fresh login URL.
+				login := func() { go lb.StartLoginInteractive(context.Background()) }
+				if authKey == "" {
+					login()
+				} else {
+					keyLogin.Do(login)
+				}
 			}
 		}
 		if nt.BrowseToURL != nil {
