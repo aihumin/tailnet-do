@@ -7,10 +7,13 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
+	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
+	"tailscale.com/tsweb"
 )
 
 // TLS certificates for serveHTTPS.
@@ -21,17 +24,28 @@ import (
 // Tailscale for it again once an hour. That hourly call is what lets
 // Tailscale renew: its own refresh loop only runs for hosts in a serve
 // config, which this build omits.
+//
+// Every call into Tailscale can end in an ACME order, and the CA limits
+// those (Let's Encrypt: about 5 identical certificates a week and 5 failed
+// validations an hour per name). The waits below keep a broken setup from
+// running into either limit.
 
 const (
 	certRefreshInterval = time.Hour
-	certLoadTimeout     = 3 * time.Minute
 	certNotRunningPoll  = time.Second
+	certDisabledPoll    = time.Minute // costs nothing: the netmap says whether HTTPS is on
+
+	// A call into Tailscale gets certLoadTimeout to finish. If it has not
+	// returned certLoadGrace after that, it is given up on, so that one
+	// stuck request cannot block handshakes and refreshes for good.
+	certLoadTimeout = 3 * time.Minute
+	certLoadGrace   = 30 * time.Second
 
 	// After a failed load the next one waits certRetryMin, doubling per
-	// consecutive failure up to certRetryMax. TLS handshakes do not start
-	// a load before then, so a broken setup cannot burn through Let's
-	// Encrypt's rate limits.
-	certRetryMin = time.Minute
+	// consecutive failure up to certRetryMax: at most 4 attempts in the
+	// first hour and one an hour after that. Handshakes and renew do not
+	// start a load inside that wait.
+	certRetryMin = 5 * time.Minute
 	certRetryMax = time.Hour
 
 	// certRenewNow is a validity no certificate has, so Tailscale renews.
@@ -43,6 +57,40 @@ var (
 	errHTTPSDisabled = errors.New("HTTPS certificates are not enabled for this tailnet; turn them on in the Tailscale admin console under DNS > HTTPS Certificates")
 	errHTTPSClosed   = errors.New("HTTPS listener closed")
 )
+
+// acmeDirectory is the ACME directory certificates come from. Tailscale
+// reads it from the process environment, so the first serveHTTPS in the
+// process picks it for all nodes.
+var acmeDirectory struct {
+	mu     sync.Mutex
+	chosen bool
+	url    string // "" is Tailscale's default, Let's Encrypt
+}
+
+// useACMEDirectory selects the ACME directory, or checks url against the
+// one already selected.
+func useACMEDirectory(url string) error {
+	name := func(u string) string {
+		if u == "" {
+			return "the default (Let's Encrypt)"
+		}
+		return u
+	}
+	acmeDirectory.mu.Lock()
+	defer acmeDirectory.mu.Unlock()
+	if !acmeDirectory.chosen {
+		acmeDirectory.chosen, acmeDirectory.url = true, url
+		if url != "" {
+			envknob.Setenv("TS_DEBUG_ACME_DIRECTORY_URL", url)
+		}
+		return nil
+	}
+	if url != acmeDirectory.url {
+		return fmt.Errorf("acmeDirectoryURL must be the same for every node that serves HTTPS in an isolate: "+
+			"another node already uses %s, this one asks for %s", name(acmeDirectory.url), name(url))
+	}
+	return nil
+}
 
 type certManager struct {
 	logf func(format string, args ...any)
@@ -59,23 +107,25 @@ type certManager struct {
 	mu         sync.Mutex
 	cert       *tls.Certificate // nil until the first successful load
 	certDomain string
-	err        error         // why the last load failed; nil after a success
+	err        error         // what is wrong, if anything; see finishLoad
 	failures   int           // consecutive failed loads
-	retryAt    time.Time     // no new load before this time
+	retryAt    time.Time     // after a failure: no new load before this time
+	holdUntil  time.Time     // after an unexpected issuance: no refresh before this time
 	loading    *certLoad     // non-nil while a load is in flight
-	first      chan struct{} // closed after the first load with an outcome
-	firstDone  bool
-	users      int // HTTPS listeners using this manager
+	outcome    chan struct{} // closed, and replaced, when a load has an outcome
+	users      int           // HTTPS listeners using this manager
 	stop       context.CancelFunc
+	stopped    chan struct{} // closed when the run started by acquire has returned
 	poke       chan struct{} // wakes run when the node's state changes
 }
 
-// certLoad is one call into Tailscale, shared by everyone who wants the
-// certificate while it runs.
+// certLoad is one call into Tailscale, shared by everyone who wants its
+// result while it runs.
 type certLoad struct {
-	done chan struct{}
-	cert *tls.Certificate
-	err  error
+	renew bool // asked for a new certificate, not the current one
+	done  chan struct{}
+	cert  *tls.Certificate
+	err   error
 }
 
 func newCertManager(
@@ -88,7 +138,7 @@ func newCertManager(
 		now:        time.Now,
 		domain:     domain,
 		getCertPEM: getCertPEM,
-		first:      make(chan struct{}),
+		outcome:    make(chan struct{}),
 		poke:       make(chan struct{}, 1),
 	}
 }
@@ -101,8 +151,12 @@ func (m *certManager) acquire() {
 	m.users++
 	if m.users == 1 {
 		ctx, cancel := context.WithCancel(context.Background())
-		m.stop = cancel
-		go m.run(ctx)
+		stopped := make(chan struct{})
+		m.stop, m.stopped = cancel, stopped
+		go func() {
+			defer close(stopped)
+			m.run(ctx)
+		}()
 	}
 }
 
@@ -150,25 +204,33 @@ func (m *certManager) run(ctx context.Context) {
 // next one, and whether the node was running.
 func (m *certManager) refresh(ctx context.Context) (wait time.Duration, running bool) {
 	m.mu.Lock()
-	retryIn := m.retryAt.Sub(m.now())
+	wait = m.waitLocked()
 	m.mu.Unlock()
-	if retryIn > 0 {
-		return retryIn, true
+	if wait > 0 {
+		return wait, true
 	}
 	_, err := m.load(ctx, 0)
 	switch {
-	case err == nil:
-		return certRefreshInterval, true
 	case errors.Is(err, errNotRunning):
 		return certNotRunningPoll, false
 	case errors.Is(err, errHTTPSDisabled):
-		// Cheap to check again, and fixed in the admin console
-		// without touching this node.
-		return certRetryMin, true
+		return certDisabledPoll, true
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return max(m.retryAt.Sub(m.now()), certRetryMin), true
+	if wait := m.waitLocked(); wait > 0 {
+		return wait, true
+	}
+	if err != nil {
+		return certRetryMin, true // ctx is done
+	}
+	return certRefreshInterval, true
+}
+
+// waitLocked returns how long refresh has to stay away from Tailscale.
+func (m *certManager) waitLocked() time.Duration {
+	now := m.now()
+	return max(m.retryAt.Sub(now), m.holdUntil.Sub(now))
 }
 
 // getCertificate is the tls.Config.GetCertificate of HTTPS listeners. Any
@@ -182,16 +244,25 @@ func (m *certManager) getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate,
 // the one in memory while it is valid, otherwise whatever a load gives.
 func (m *certManager) certificate(ctx context.Context) (*tls.Certificate, error) {
 	m.mu.Lock()
-	cert, err, retryAt := m.cert, m.err, m.retryAt
+	cert := m.cert
+	waitErr := m.retryErrLocked()
 	m.mu.Unlock()
-	now := m.now()
-	if cert != nil && now.Before(cert.Leaf.NotAfter) {
+	if cert != nil && m.now().Before(cert.Leaf.NotAfter) {
 		return cert, nil
 	}
-	if err != nil && now.Before(retryAt) {
-		return nil, fmt.Errorf("no TLS certificate, next attempt at %s: %w", retryAt.UTC().Format(time.RFC3339), err)
+	if waitErr != nil {
+		return nil, waitErr
 	}
 	return m.load(ctx, 0)
+}
+
+// retryErrLocked returns an error if the last load failed and the wait
+// before the next one is not over.
+func (m *certManager) retryErrLocked() error {
+	if m.err == nil || !m.now().Before(m.retryAt) {
+		return nil
+	}
+	return fmt.Errorf("no new attempt before %s: %w", m.retryAt.UTC().Format(time.RFC3339), m.err)
 }
 
 // load asks Tailscale for the certificate, which comes from the state store
@@ -213,120 +284,184 @@ func (m *certManager) load(ctx context.Context, minValidity time.Duration) (*tls
 	}
 }
 
-// renew replaces the certificate with a newly issued one.
+// renew replaces the certificate with a newly issued one. Calls that
+// overlap share one issuance, and like any other load it waits out the
+// delay after a failure.
 func (m *certManager) renew(ctx context.Context) (*tls.Certificate, error) {
 	for {
 		m.mu.Lock()
 		l := m.loading
 		if l == nil {
-			l = m.startLoadLocked(certRenewNow)
-			m.mu.Unlock()
-			select {
-			case <-l.done:
-				return l.cert, l.err
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			if err := m.retryErrLocked(); err != nil {
+				m.mu.Unlock()
+				return nil, err
 			}
+			l = m.startLoadLocked(certRenewNow)
 		}
 		m.mu.Unlock()
-		// An ordinary load is in flight and would hand back the
-		// current certificate. Let it finish first.
 		select {
 		case <-l.done:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+		if l.renew {
+			return l.cert, l.err
+		}
+		// That was an ordinary load, which hands back the current
+		// certificate. Now that it is out of the way, renew.
 	}
 }
 
+type loadResult struct {
+	cert   *tls.Certificate
+	domain string
+	cached bool
+	err    error
+}
+
 func (m *certManager) startLoadLocked(minValidity time.Duration) *certLoad {
-	l := &certLoad{done: make(chan struct{})}
+	l := &certLoad{renew: minValidity == certRenewNow, done: make(chan struct{})}
 	m.loading = l
 	go func() {
-		cert, domain, cached, err := m.fetch(minValidity)
-		m.finishLoad(cert, domain, cached, err)
-		l.cert, l.err = cert, err
+		ch := make(chan loadResult, 1)
+		go func() { ch <- m.fetch(minValidity) }()
+		var r loadResult
+		t := time.NewTimer(certLoadTimeout + certLoadGrace)
+		select {
+		case r = <-ch:
+			t.Stop()
+		case <-t.C:
+			r.err = fmt.Errorf("getting a certificate: no answer from Tailscale after %v", certLoadTimeout+certLoadGrace)
+		}
+		m.finishLoad(l, r)
+		l.cert, l.err = r.cert, r.err
 		close(l.done)
 	}()
 	return l
 }
 
-func (m *certManager) fetch(minValidity time.Duration) (cert *tls.Certificate, domain string, cached bool, err error) {
-	domain, err = m.domain()
+func (m *certManager) fetch(minValidity time.Duration) loadResult {
+	domain, err := m.domain()
 	if err != nil {
-		return nil, "", false, err
+		return loadResult{err: err}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), certLoadTimeout)
 	defer cancel()
 	pair, err := m.getCertPEM(ctx, domain, minValidity)
 	if err != nil {
-		return nil, domain, false, fmt.Errorf("getting a certificate for %s: %w", domain, err)
+		return loadResult{domain: domain, err: fmt.Errorf("getting a certificate for %s: %w", domain, err)}
 	}
 	c, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
+	if err == nil && c.Leaf == nil {
+		c.Leaf, err = x509.ParseCertificate(c.Certificate[0])
+	}
 	if err != nil {
-		return nil, domain, false, fmt.Errorf("certificate for %s: %w", domain, err)
+		return loadResult{domain: domain, err: fmt.Errorf("certificate for %s: %w", domain, err)}
 	}
-	if c.Leaf == nil {
-		if c.Leaf, err = x509.ParseCertificate(c.Certificate[0]); err != nil {
-			return nil, domain, false, fmt.Errorf("certificate for %s: %w", domain, err)
-		}
-	}
-	return &c, domain, pair.Cached, nil
+	return loadResult{cert: &c, domain: domain, cached: pair.Cached}
 }
 
 // finishLoad records the outcome of a load and logs what changed.
-func (m *certManager) finishLoad(cert *tls.Certificate, domain string, cached bool, err error) {
+//
+// m.err is set when a load fails, and cleared when one succeeds. It is also
+// set, with a certificate in place, when Tailscale issued a certificate that
+// nothing asked for: see below.
+func (m *certManager) finishLoad(l *certLoad, r loadResult) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.loading = nil
-	if errors.Is(err, errNotRunning) {
+	if errors.Is(r.err, errNotRunning) {
 		return // not an outcome yet; run tries again shortly
 	}
-	if !m.firstDone {
-		m.firstDone = true
-		close(m.first)
-	}
-	if err != nil {
-		if m.err == nil || m.err.Error() != err.Error() {
-			m.logf("https: %v", err)
+	defer func() {
+		close(m.outcome)
+		m.outcome = make(chan struct{})
+	}()
+	now := m.now()
+	if r.err != nil {
+		if m.err == nil || m.err.Error() != r.err.Error() {
+			m.logf("https: %v", r.err)
 		}
-		m.err = err
-		if !errors.Is(err, errHTTPSDisabled) {
+		m.err = r.err
+		if !errors.Is(r.err, errHTTPSDisabled) {
 			m.failures++
-			m.retryAt = m.now().Add(min(certRetryMin<<min(m.failures-1, 10), certRetryMax))
+			wait := min(certRetryMin<<min(m.failures-1, 10), certRetryMax)
+			m.retryAt = now.Add(max(wait, retryAfter(r.err)))
 		}
 		return
 	}
-	prev := m.cert
-	m.cert, m.certDomain, m.err, m.failures, m.retryAt = cert, domain, nil, 0, time.Time{}
-	if prev != nil && bytes.Equal(prev.Certificate[0], cert.Certificate[0]) {
+
+	prev, prevDomain := m.cert, m.certDomain
+	m.cert, m.certDomain, m.err, m.failures, m.retryAt = r.cert, r.domain, nil, 0, time.Time{}
+	if r.cached {
+		m.holdUntil = time.Time{} // the state store works
+	}
+	if prev != nil && bytes.Equal(prev.Certificate[0], r.cert.Certificate[0]) {
 		return
 	}
-	what := "issued a new certificate"
+	expires := r.cert.Leaf.NotAfter.UTC().Format(time.RFC3339)
 	switch {
-	case cached && prev == nil:
-		what = "using the stored certificate"
-	case cached:
-		what = "using the renewed certificate"
+	case !r.cached && !l.renew && prev != nil && prevDomain == r.domain && now.Before(prev.Leaf.NotAfter):
+		// Tailscale had to issue, although the certificate it gave us
+		// before is still good: it could not read that one back from
+		// the state store, or no longer accepts it. Asking again in an
+		// hour would issue again, and five of those use up the CA's
+		// weekly allowance. This certificate works from memory, so
+		// leave Tailscale alone until it is due for renewal.
+		leaf := r.cert.Leaf
+		m.holdUntil = leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore) * 2 / 3)
+		m.err = fmt.Errorf("the stored certificate for %s was not reused and a new one was issued; "+
+			"not asking for it again before %s", r.domain, m.holdUntil.UTC().Format(time.RFC3339))
+		m.logf("https: %v", m.err)
+	case !r.cached:
+		m.logf("https: issued a new certificate for %s, expires %s", r.domain, expires)
+	case prev == nil:
+		m.logf("https: using the stored certificate for %s, expires %s", r.domain, expires)
+	default:
+		m.logf("https: using the renewed certificate for %s, expires %s", r.domain, expires)
 	}
-	m.logf("https: %s for %s, expires %s", what, domain, cert.Leaf.NotAfter.UTC().Format(time.RFC3339))
 }
 
-// waitFirst blocks until the first load has an outcome and returns it.
-func (m *certManager) waitFirst(ctx context.Context) (*certInfo, error) {
-	select {
-	case <-m.first:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+// retryAfter returns how long the CA asked us to wait, if err is Tailscale's
+// rate-limit error, which carries that as an HTTP 429 response.
+func retryAfter(err error) time.Duration {
+	var hs interface{ HTTPStatus() tsweb.HTTPError }
+	if !errors.As(err, &hs) {
+		return 0
 	}
-	info, err := m.info()
-	if info == nil && err == nil {
-		err = errors.New("no TLS certificate")
+	secs, _ := strconv.Atoi(hs.HTTPStatus().Header.Get("Retry-After"))
+	return time.Duration(secs) * time.Second
+}
+
+// watch returns a func that reports whether a certificate is in place: at
+// once if there is one now, or if the last load failed and the next has to
+// wait; otherwise with the outcome of the next load. It is split in two so
+// that a caller can start watching before it triggers that load.
+func (m *certManager) watch() func(ctx context.Context) (*certInfo, error) {
+	m.mu.Lock()
+	outcome := m.outcome
+	settled := m.cert != nil || m.retryErrLocked() != nil
+	m.mu.Unlock()
+	return func(ctx context.Context) (*certInfo, error) {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
+		if !settled {
+			select {
+			case <-outcome:
+			case <-ctx.Done():
+				return nil, context.Cause(ctx)
+			}
+		}
+		info, err := m.info()
+		switch {
+		case info != nil:
+			return info, nil // serving; anything else is in status()
+		case err == nil:
+			err = errors.New("no TLS certificate")
+		}
+		return nil, err
 	}
-	if info != nil {
-		err = nil // serving; a later refresh failure is in status()
-	}
-	return info, err
 }
 
 // certInfo describes the certificate in use.
@@ -339,8 +474,8 @@ func (c *certInfo) js() map[string]any {
 	return map[string]any{"domain": c.Domain, "expiry": c.Expiry.UTC().Format(time.RFC3339)}
 }
 
-// info returns the certificate in use, if any, and the error of the last
-// load, if it failed.
+// info returns the certificate in use, if any, and what is wrong, if
+// anything.
 func (m *certManager) info() (*certInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

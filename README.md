@@ -45,18 +45,22 @@ Options: `authKey`, `hostname`, `controlURL`, `ephemeral`, `tags`, `exitNode`, `
 ```js
 async onTailnet(tailnet) {
   const https = tailnet.serveHTTPS(443, (req, who) => new Response(`hi ${who.loginName}`));
-  const { domain, expiry } = await https.ready; // optional
+  https.ready.then(
+    ({ domain, expiry }) => console.log(`serving https://${domain}/ until ${expiry}`),
+    (err) => console.log(`no certificate yet: ${err.message}`),
+  );
 }
 ```
 
 The node then answers on `https://<hostname>.<tailnet>.ts.net/` with a certificate that browsers and curl accept. Tailscale's client gets it from Let's Encrypt, the same way `tailscale cert` does: the control server publishes the DNS record that proves ownership of the name, so the node needs no public address.
 
 - Turn on **HTTPS Certificates** for the tailnet first (admin console, DNS page). Without it `ready` rejects and `status().certError` says so. The node checks again every minute, so there is nothing to restart once it is on.
+- Do not `await` `ready` inside `onTailnet()`. It stays pending until the node is running, and `TailnetObject` waits for `onTailnet()` before it answers anything, including `tailnetStatus()` with the login URL.
 - The first certificate is issued when the node first comes up, which takes a moment. The port accepts connections right away, and TLS handshakes wait for the certificate.
 - The certificate, its key and the ACME account key are stored with the node's state in Durable Object storage. A restart or deploy reuses them and does not issue again. Renewal is automatic.
-- `status()` reports `certDomain` (absent until the node is running, and while HTTPS is disabled for the tailnet), `certExpiry`, and `certError` if the last attempt to get or refresh the certificate failed. After a failure the node retries with a delay that grows from one minute to one hour.
-- `renewCertificate()` issues a replacement now. You only need it to test renewal.
-- Let's Encrypt limits how many certificates it issues per name (about five identical ones a week), and every certificate, with its hostname, is published in Certificate Transparency logs. While developing, pass `acmeDirectoryURL: LETSENCRYPT_STAGING_URL` (exported by this package), or set `TS_ACME_DIRECTORY_URL` when using `TailnetObject`. Staging certificates are not trusted by clients, so test with `curl -k`. The directory is one setting per isolate: every node in it must use the same one. When you switch from staging to production, the stored staging certificate is replaced by itself.
+- `status()` reports `certDomain` (absent until the node is running, and while HTTPS is disabled for the tailnet), `certExpiry`, and `certError` if the last attempt to get the certificate failed. After a failure the node retries with a delay that grows from five minutes to one hour. A renewal that fails in the background is only logged, and is tried again every hour while the old certificate keeps working, so monitor `certExpiry` too.
+- `renewCertificate()` issues a replacement now. You only need it to test renewal. Each call issues a certificate, so keep it away from untrusted callers.
+- Let's Encrypt limits how many certificates it issues per name (about five identical ones a week), and every certificate, with its hostname, is published in Certificate Transparency logs. While developing, pass `acmeDirectoryURL: LETSENCRYPT_STAGING_URL` (exported by this package), or set `TS_ACME_DIRECTORY_URL` when using `TailnetObject`. Staging certificates are not trusted by clients, so test with `curl -k`. Tailscale has one ACME directory per process, so all nodes that serve HTTPS in an isolate must use the same one; `serveHTTPS` throws on a node that asks for another. When you switch from staging to production, the stored staging certificate is replaced by itself. The other way round it is not: a production certificate stays in use, so clear the node's storage to go back to staging.
 - A node with a new name or wiped storage gets a new certificate, so keep the Durable Object's storage, and use a stable `hostname`.
 
 ## Limits
@@ -77,7 +81,7 @@ The node then answers on `https://<hostname>.<tailnet>.ts.net/` with a certifica
 ```sh
 git submodule update --init --depth 1
 npm run build                      # apply patches, then build src/tailnet.wasm
-npm test                           # Go engine unit tests, run as wasm under Node
+npm test                           # tests of the Tailscale patches, and of the engine as wasm under Node
 npm run test:e2e                   # test/local-tailnet/run.sh
 cd examples/exit-node && npx wrangler dev
 ```

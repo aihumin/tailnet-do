@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall/js"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn/ipnlocal"
+	"tailscale.com/tsweb"
 )
 
 const testDomain = "node.example.ts.net"
@@ -181,6 +183,14 @@ func (n *node) handlerForTest(port uint16) (func(net.Conn), bool) {
 	return func(c net.Conn) { l.handle(c, netip.AddrPort{}) }, true
 }
 
+// soon bounds a wait that should be over quickly, so that a regression
+// fails its test instead of hanging the run.
+func soon(t *testing.T) context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func samePair(c *tls.Certificate, p *ipnlocal.TLSCertKeyPair) bool {
 	block, _ := pem.Decode(p.CertPEM)
 	return c != nil && bytes.Equal(c.Certificate[0], block.Bytes)
@@ -194,7 +204,7 @@ func TestCertManagerServesFromMemory(t *testing.T) {
 	f.set(func() { f.pair = stored })
 
 	for i := range 3 {
-		cert, err := m.certificate(context.Background())
+		cert, err := m.certificate(soon(t))
 		if err != nil {
 			t.Fatalf("handshake %d: %v", i, err)
 		}
@@ -230,32 +240,42 @@ func TestCertManagerHTTPSDisabled(t *testing.T) {
 	f := newFakeTailscale(t)
 	m := f.certManager
 	f.set(func() { f.domainErr = errHTTPSDisabled })
+	ready := m.watch()
 
-	_, err := m.certificate(context.Background())
+	_, err := m.certificate(soon(t))
 	if !errors.Is(err, errHTTPSDisabled) {
 		t.Fatalf("handshake error = %v, want errHTTPSDisabled", err)
 	}
-	if _, err := m.waitFirst(context.Background()); !errors.Is(err, errHTTPSDisabled) {
-		t.Errorf("waitFirst = %v, want errHTTPSDisabled", err)
+	if _, err := ready(soon(t)); !errors.Is(err, errHTTPSDisabled) {
+		t.Errorf("ready = %v, want errHTTPSDisabled", err)
 	}
 	if n := f.numCalls(); n != 0 {
 		t.Errorf("Tailscale was asked for a certificate %d times with HTTPS disabled", n)
 	}
-	if wait, _ := m.refresh(context.Background()); wait != certRetryMin {
-		t.Errorf("refresh wait = %v, want %v", wait, certRetryMin)
+	if wait, _ := m.refresh(soon(t)); wait != certDisabledPoll {
+		t.Errorf("refresh wait = %v, want %v", wait, certDisabledPoll)
 	}
 
-	// Enabled in the admin console: the next handshake gets a certificate.
+	// Enabled in the admin console. A listener added now must hear about
+	// the certificate, not about the old failure.
 	ca := newTestCA(t)
 	f.set(func() {
 		f.domainErr = nil
 		f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), false)
 	})
-	if _, err := m.certificate(context.Background()); err != nil {
+	ready = m.watch()
+	if _, err := m.certificate(soon(t)); err != nil {
 		t.Fatalf("handshake after enabling HTTPS: %v", err)
+	}
+	if info, err := ready(soon(t)); err != nil || info.Domain != testDomain {
+		t.Errorf("ready after enabling HTTPS = %+v, %v", info, err)
 	}
 	if _, err := m.info(); err != nil {
 		t.Errorf("error still reported after a successful load: %v", err)
+	}
+	// With a certificate in place there is nothing to wait for.
+	if info, err := m.watch()(soon(t)); err != nil || info == nil {
+		t.Errorf("ready with a certificate in place = %+v, %v", info, err)
 	}
 }
 
@@ -263,15 +283,16 @@ func TestCertManagerNotRunningIsNotAnOutcome(t *testing.T) {
 	f := newFakeTailscale(t)
 	m := f.certManager
 	f.set(func() { f.domainErr = errNotRunning })
+	ready := m.watch()
 
-	wait, running := m.refresh(context.Background())
+	wait, running := m.refresh(soon(t))
 	if running || wait != certNotRunningPoll {
 		t.Errorf("refresh = %v, %v; want %v, false", wait, running, certNotRunningPoll)
 	}
-	select {
-	case <-m.first:
-		t.Error("first outcome reported while the node is not running")
-	default:
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := ready(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ready while the node is not running = %v, want it to keep waiting", err)
 	}
 	if _, err := m.info(); err != nil {
 		t.Errorf("info error = %v, want none", err)
@@ -281,51 +302,151 @@ func TestCertManagerNotRunningIsNotAnOutcome(t *testing.T) {
 func TestCertManagerBacksOffAfterFailure(t *testing.T) {
 	f := newFakeTailscale(t)
 	m := f.certManager
-	f.set(func() { f.err = errors.New("acme: rate limited") })
+	f.set(func() { f.err = errors.New("acme: validation failed") })
+	start := f.now
 
-	if _, err := m.certificate(context.Background()); err == nil {
+	if _, err := m.certificate(soon(t)); err == nil {
 		t.Fatal("handshake succeeded without a certificate")
 	}
-	// More handshakes and refreshes inside the backoff must not reach
-	// Tailscale (and through it, Let's Encrypt).
+	// Handshakes, refreshes, renewals and new listeners inside the wait
+	// must not reach Tailscale (and through it, Let's Encrypt).
 	for range 5 {
-		_, err := m.certificate(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "rate limited") {
+		_, err := m.certificate(soon(t))
+		if err == nil || !strings.Contains(err.Error(), "validation failed") {
 			t.Fatalf("handshake in backoff: err = %v, want the load error", err)
 		}
+		if _, err := m.renew(soon(t)); err == nil || !strings.Contains(err.Error(), "validation failed") {
+			t.Fatalf("renew in backoff: err = %v, want the load error", err)
+		}
+		if _, err := m.watch()(soon(t)); err == nil || !strings.Contains(err.Error(), "validation failed") {
+			t.Fatalf("ready in backoff: err = %v, want the load error", err)
+		}
 	}
-	if wait, _ := m.refresh(context.Background()); wait != certRetryMin {
+	if wait, _ := m.refresh(soon(t)); wait != certRetryMin {
 		t.Errorf("refresh wait in backoff = %v, want %v", wait, certRetryMin)
 	}
 	if n := f.numCalls(); n != 1 {
 		t.Fatalf("Tailscale was asked %d times, want 1", n)
 	}
 
-	// Each failure doubles the wait, up to certRetryMax.
+	// Each failure doubles the wait, up to certRetryMax. Follow the
+	// schedule the refresh loop would, and count attempts per hour.
 	want := certRetryMin
+	var attempts []time.Duration // since start
+	attempts = append(attempts, 0)
 	for i := 2; i < 12; i++ {
 		f.set(func() { f.now = f.now.Add(want) })
+		attempts = append(attempts, f.now.Sub(start))
 		want = min(want*2, certRetryMax)
-		if wait, _ := m.refresh(context.Background()); wait != want {
+		if wait, _ := m.refresh(soon(t)); wait != want {
 			t.Fatalf("wait after failure %d = %v, want %v", i, wait, want)
 		}
 		if n := f.numCalls(); n != i {
 			t.Fatalf("Tailscale was asked %d times after %d backoffs, want %d", n, i-1, i)
 		}
 	}
+	// Let's Encrypt allows 5 failed validations per name per hour.
+	for i, from := range attempts {
+		n := 0
+		for _, at := range attempts[i:] {
+			if at-from < time.Hour {
+				n++
+			}
+		}
+		if n > 4 {
+			t.Errorf("%d attempts in the hour from %v: %v", n, from, attempts)
+		}
+	}
 
-	// Success clears the backoff.
+	// Success clears the backoff: the next failure starts over.
 	ca := newTestCA(t)
 	f.set(func() {
 		f.now = f.now.Add(certRetryMax)
 		f.err = nil
-		f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), false)
+		f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true)
 	})
-	if wait, _ := m.refresh(context.Background()); wait != certRefreshInterval {
+	if wait, _ := m.refresh(soon(t)); wait != certRefreshInterval {
 		t.Errorf("wait after success = %v, want %v", wait, certRefreshInterval)
 	}
-	if _, err := m.certificate(context.Background()); err != nil {
+	if _, err := m.certificate(soon(t)); err != nil {
 		t.Errorf("handshake after recovery: %v", err)
+	}
+	f.set(func() { f.err = errors.New("acme: validation failed") })
+	if wait, _ := m.refresh(soon(t)); wait != certRetryMin {
+		t.Errorf("wait after the first failure following a success = %v, want %v", wait, certRetryMin)
+	}
+}
+
+// rateLimited is shaped like Tailscale's error for an ACME rate limit.
+type rateLimited struct{ retryAfter time.Duration }
+
+func (e rateLimited) Error() string { return "acme: too many certificates" }
+func (e rateLimited) HTTPStatus() tsweb.HTTPError {
+	h := http.Header{}
+	h.Set("Retry-After", strconv.Itoa(int(e.retryAfter.Seconds())))
+	return tsweb.HTTPError{Code: http.StatusTooManyRequests, Header: h}
+}
+
+func TestCertManagerHonoursRetryAfter(t *testing.T) {
+	f := newFakeTailscale(t)
+	m := f.certManager
+	f.set(func() { f.err = rateLimited{retryAfter: 36 * time.Hour} })
+	if wait, _ := m.refresh(soon(t)); wait != 36*time.Hour {
+		t.Errorf("wait after a rate limit with Retry-After 36h = %v", wait)
+	}
+	f.set(func() { f.now = f.now.Add(35 * time.Hour) })
+	m.refresh(soon(t))
+	m.certificate(soon(t))
+	if n := f.numCalls(); n != 1 {
+		t.Errorf("Tailscale was asked %d times before Retry-After was over, want 1", n)
+	}
+}
+
+// TestCertManagerStopsAfterUnexpectedIssuance covers a state store that
+// does not give back the certificate it was given, or a stored certificate
+// Tailscale no longer accepts: every load would be a new issuance.
+func TestCertManagerStopsAfterUnexpectedIssuance(t *testing.T) {
+	ca := newTestCA(t)
+	f := newFakeTailscale(t)
+	m := f.certManager
+	issue := func() {
+		f.set(func() { f.pair = ca.issue(t, f.now, f.now.Add(90*24*time.Hour), false) })
+	}
+
+	issue()
+	if wait, _ := m.refresh(soon(t)); wait != certRefreshInterval {
+		t.Fatalf("wait after the first issuance = %v, want %v", wait, certRefreshInterval)
+	}
+	// An hour later Tailscale issues again instead of returning that one.
+	f.set(func() { f.now = f.now.Add(certRefreshInterval) })
+	issue()
+	wait, _ := m.refresh(soon(t))
+	if want := 60*24*time.Hour - time.Second; wait < want {
+		t.Fatalf("wait after an unexpected issuance = %v, want about 60 days (2/3 of the lifetime)", wait)
+	}
+	if _, err := m.info(); err == nil || !strings.Contains(err.Error(), "not reused") {
+		t.Errorf("status error = %v, want it to say the stored certificate was not reused", err)
+	}
+	for range 24 * 30 {
+		f.set(func() { f.now = f.now.Add(certRefreshInterval) })
+		issue()
+		m.refresh(soon(t))
+		if _, err := m.certificate(soon(t)); err != nil {
+			t.Fatalf("handshake while holding off: %v", err)
+		}
+	}
+	if n := f.numCalls(); n != 2 {
+		t.Errorf("Tailscale was asked %d times in 30 days, want 2", n)
+	}
+
+	// A renewal that was asked for is not held back, and is not mistaken
+	// for the same problem.
+	issue()
+	if _, err := m.renew(soon(t)); err != nil {
+		t.Fatalf("renew while holding off: %v", err)
+	}
+	if n := f.numCalls(); n != 3 {
+		t.Errorf("Tailscale was asked %d times after renew, want 3", n)
 	}
 }
 
@@ -335,18 +456,18 @@ func TestCertManagerPicksUpRenewal(t *testing.T) {
 	m := f.certManager
 	old := ca.issue(t, f.now.Add(-60*24*time.Hour), f.now.Add(30*24*time.Hour), true)
 	f.set(func() { f.pair = old })
-	if wait, _ := m.refresh(context.Background()); wait != certRefreshInterval {
+	if wait, _ := m.refresh(soon(t)); wait != certRefreshInterval {
 		t.Fatalf("refresh wait = %v, want %v", wait, certRefreshInterval)
 	}
 
 	// Tailscale renewed in the background; the hourly refresh sees it.
 	renewed := ca.issue(t, f.now, f.now.Add(90*24*time.Hour), true)
 	f.set(func() { f.pair = renewed })
-	if cert, _ := m.certificate(context.Background()); !samePair(cert, old) {
+	if cert, _ := m.certificate(soon(t)); !samePair(cert, old) {
 		t.Fatal("handshake before the refresh did not use the certificate in memory")
 	}
-	m.refresh(context.Background())
-	if cert, _ := m.certificate(context.Background()); !samePair(cert, renewed) {
+	m.refresh(soon(t))
+	if cert, _ := m.certificate(soon(t)); !samePair(cert, renewed) {
 		t.Fatal("handshake after the refresh did not use the renewed certificate")
 	}
 	if !f.logged("using the renewed certificate") {
@@ -359,7 +480,7 @@ func TestCertManagerReloadsExpiredCert(t *testing.T) {
 	f := newFakeTailscale(t)
 	m := f.certManager
 	f.set(func() { f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true) })
-	if _, err := m.certificate(context.Background()); err != nil {
+	if _, err := m.certificate(soon(t)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,7 +489,7 @@ func TestCertManagerReloadsExpiredCert(t *testing.T) {
 		f.now = f.now.Add(2 * time.Hour)
 		f.pair = fresh
 	})
-	cert, err := m.certificate(context.Background())
+	cert, err := m.certificate(soon(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +512,7 @@ func TestCertManagerSharesOneLoad(t *testing.T) {
 	errs := make(chan error, handshakes)
 	for range handshakes {
 		go func() {
-			_, err := m.certificate(context.Background())
+			_, err := m.certificate(soon(t))
 			errs <- err
 		}()
 	}
@@ -416,18 +537,56 @@ func TestCertManagerRenew(t *testing.T) {
 	ca := newTestCA(t)
 	f := newFakeTailscale(t)
 	m := f.certManager
-	f.set(func() { f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true) })
-	if _, err := m.load(context.Background(), 0); err != nil {
+	stored := ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true)
+	f.set(func() { f.pair = stored })
+	if _, err := m.load(soon(t), 0); err != nil {
 		t.Fatal(err)
+	}
+
+	// An ordinary load is in flight when two renewals are asked for. They
+	// must wait for it, then share one issuance between them.
+	block := make(chan struct{})
+	f.set(func() { f.block = block })
+	loaded := make(chan *tls.Certificate, 1)
+	go func() {
+		c, _ := m.load(soon(t), 0)
+		loaded <- c
+	}()
+	for f.numCalls() < 2 {
+		time.Sleep(time.Millisecond)
 	}
 	renewed := ca.issue(t, f.now, f.now.Add(48*time.Hour), false)
-	f.set(func() { f.pair = renewed })
-	cert, err := m.renew(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	type result struct {
+		cert *tls.Certificate
+		err  error
 	}
-	if !samePair(cert, renewed) {
-		t.Error("renew did not return the new certificate")
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			c, err := m.renew(soon(t))
+			results <- result{c, err}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond) // let both reach the wait
+	if n := f.numCalls(); n != 2 {
+		t.Fatalf("renew did not wait for the load in flight: %d calls", n)
+	}
+	close(block)
+	if c := <-loaded; !samePair(c, stored) {
+		t.Error("the load in flight did not return the stored certificate")
+	}
+	f.set(func() { f.block, f.pair = nil, renewed })
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if !samePair(r.cert, renewed) {
+			t.Error("renew returned the certificate of the ordinary load")
+		}
+	}
+	if n := f.numCalls(); n != 3 {
+		t.Errorf("Tailscale was asked %d times for a load and two overlapping renewals, want 3", n)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -436,20 +595,73 @@ func TestCertManagerRenew(t *testing.T) {
 	}
 }
 
-func TestCertManagerRunStopsOnRelease(t *testing.T) {
+// TestCertManagerRun runs the real refresh loop: it has to wait for the
+// node, react to a state change without waiting for its poll, and end with
+// the last listener and not before.
+func TestCertManagerRun(t *testing.T) {
 	ca := newTestCA(t)
 	f := newFakeTailscale(t)
 	m := f.certManager
-	f.set(func() { f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true) })
+	f.set(func() { f.domainErr = errNotRunning })
+	ready := m.watch()
 	m.acquire()
-	if _, err := m.waitFirst(context.Background()); err != nil {
+	m.acquire() // a second listener
+	time.Sleep(50 * time.Millisecond)
+	if n := f.numCalls(); n != 0 {
+		t.Fatalf("Tailscale was asked %d times while the node was not running", n)
+	}
+
+	// The node comes up. The loop is told and loads at once, well inside
+	// its one-second poll.
+	f.set(func() {
+		f.domainErr = nil
+		f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true)
+	})
+	start := time.Now()
+	m.stateChanged()
+	if _, err := ready(soon(t)); err != nil {
 		t.Fatalf("run did not load the certificate: %v", err)
 	}
+	if d := time.Since(start); d > certNotRunningPoll/2 {
+		t.Errorf("certificate loaded %v after the state change, want it at once", d)
+	}
+
 	m.release()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.stop != nil {
-		t.Error("refresh loop still has a cancel func after the last release")
+	stopped := m.stopped
+	m.mu.Unlock()
+	select {
+	case <-stopped:
+		t.Fatal("refresh loop ended while a listener was left")
+	case <-time.After(20 * time.Millisecond):
+	}
+	m.release()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh loop still running after the last release")
+	}
+}
+
+// TestCertManagerRunPolls checks that the loop keeps going by itself: with
+// no state change announced, its poll finds that the node came up.
+func TestCertManagerRunPolls(t *testing.T) {
+	ca := newTestCA(t)
+	f := newFakeTailscale(t)
+	m := f.certManager
+	f.set(func() { f.domainErr = errNotRunning })
+	ready := m.watch()
+	m.acquire()
+	defer m.release()
+	time.Sleep(50 * time.Millisecond) // the first pass has seen "not running"
+	f.set(func() {
+		f.domainErr = nil
+		f.pair = ca.issue(t, f.now.Add(-time.Hour), f.now.Add(time.Hour), true)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*certNotRunningPoll)
+	defer cancel()
+	if _, err := ready(ctx); err != nil {
+		t.Fatalf("the poll did not pick the certificate up: %v", err)
 	}
 }
 
@@ -518,6 +730,22 @@ func TestServeHTTPS(t *testing.T) {
 	n.setListener(443, nil, nil)
 	if f.certManager.users != 0 {
 		t.Errorf("certManager has %d users after the listener closed", f.certManager.users)
+	}
+}
+
+func TestSetListenerClosesTheOneItReplaces(t *testing.T) {
+	n := &node{listeners: map[uint16]portListener{}}
+	var closed []string
+	handle := func(net.Conn, netip.AddrPort) {}
+	n.setListener(443, handle, func() { closed = append(closed, "first") })
+	n.setListener(443, handle, func() { closed = append(closed, "second") })
+	if len(closed) != 1 || closed[0] != "first" {
+		t.Fatalf("after replacing the listener, closed = %v, want [first]", closed)
+	}
+	n.setListener(443, nil, nil)
+	n.setListener(443, nil, nil)
+	if len(closed) != 2 || closed[1] != "second" {
+		t.Fatalf("after unlisten, closed = %v, want [first second]", closed)
 	}
 }
 
