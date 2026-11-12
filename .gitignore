@@ -2,3 +2,4 @@ node_modules/
 .wrangler/
 src/tailnet.wasm
 .dev.vars
+test/local-tailnet/.run/
