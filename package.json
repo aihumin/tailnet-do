@@ -10,5 +10,5 @@
     "patch": "./scripts/apply-patches.sh",
     "build": "./scripts/apply-patches.sh && ./scripts/build-wasm.sh"
   },
-  "license": "BSD-3-Clause"
+  "license": "MIT"
 }
