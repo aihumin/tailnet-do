@@ -6,10 +6,11 @@
   "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "HttpsNode" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HttpsNode"] }],
   // The fake services from ../fake. The auth key is a placeholder: the fake
-  // control server accepts any.
+  // control server accepts any. ACCESS_TOKEN is what run.sh sends.
   "vars": {
     "TS_CONTROL_URL": "http://127.0.0.1:8611",
     "TS_ACME_DIRECTORY_URL": "http://127.0.0.1:8612/directory",
-    "TS_AUTHKEY": "local-fake-tailnet"
+    "TS_AUTHKEY": "local-fake-tailnet",
+    "ACCESS_TOKEN": "local-test-token"
   }
 }
