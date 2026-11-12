@@ -72,10 +72,10 @@ index a7b5aea0da22a01cbb2cf4b4b4e574a4b7e74ce8..75c0d1128f3c6990f1c827fa58f51c32
  
 diff --git a/feature/acme/certstore_test.go b/feature/acme/certstore_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..04c407717ee9a7d6d23e0dbb7ca6ee92b5cca1c5
+index 0000000000000000000000000000000000000000..e3e78237a61d94c491f561d9ed27cc7c4e7205d4
 --- /dev/null
 +++ b/feature/acme/certstore_test.go
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,175 @@
 +// Copyright (c) Tailscale Inc & contributors
 +// SPDX-License-Identifier: BSD-3-Clause
 +
@@ -90,6 +90,7 @@ index 0000000000000000000000000000000000000000..04c407717ee9a7d6d23e0dbb7ca6ee92
 +	"testing"
 +	"time"
 +
++	"tailscale.com/hostinfo"
 +	"tailscale.com/ipn"
 +	"tailscale.com/ipn/ipnlocal"
 +	"tailscale.com/ipn/ipnlocal/ipnlocaltest"
@@ -146,6 +147,9 @@ index 0000000000000000000000000000000000000000..04c407717ee9a7d6d23e0dbb7ca6ee92
 +			}
 +			cs, err := extOf(t, b).getCertStore(b)
 +			if !tt.wantState {
++				if hostinfo.GetEnvType() == hostinfo.Kubernetes {
++					t.Skip("on Kubernetes every custom state store holds certs")
++				}
 +				if _, ok := cs.(certStateStore); ok {
 +					t.Fatalf("getCertStore = %T; a store that did not opt in must not hold certs", cs)
 +				}
@@ -172,7 +176,7 @@ index 0000000000000000000000000000000000000000..04c407717ee9a7d6d23e0dbb7ca6ee92
 +// whose state store implements [TLSCertStorer], and that has no var
 +// root, is kept in the state store along with the ACME account key, and
 +// that a new backend on the same store serves that cert without
-+// talking to the ACME server again.
++// ordering another one.
 +func TestTLSCertStorerSurvivesRestart(t *testing.T) {
 +	const domain = "example.com"
 +	s := acmetest.Start(t)
